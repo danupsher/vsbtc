@@ -44,7 +44,7 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 720.0])
             .with_min_inner_size([900.0, 500.0])
-            .with_title("vsBTC")
+            .with_title(format!("vsBTC v{}", env!("CARGO_PKG_VERSION")))
             .with_icon(std::sync::Arc::new(load_icon()))
             .with_app_id("vsbtc"),
         ..Default::default()

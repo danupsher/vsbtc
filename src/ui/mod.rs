@@ -1,3 +1,3 @@
 pub mod app;
 
-pub use app::CryptoScreenerApp;
+pub use app::VsBtcApp;

@@ -31,7 +31,7 @@ impl Database {
     fn db_path() -> Result<PathBuf, String> {
         let data_dir =
             dirs::data_dir().ok_or_else(|| "Could not determine data directory".to_string())?;
-        Ok(data_dir.join("cryptoscreener").join("data.db"))
+        Ok(data_dir.join("vsbtc").join("data.db"))
     }
 
     fn init_tables(&self) -> Result<(), String> {
@@ -136,10 +136,13 @@ impl Database {
             .conn
             .prepare_cached(
                 "SELECT coin, interval, timestamp, open, high, low, close, volume
-                 FROM candles
-                 WHERE coin = ?1 AND interval = ?2
-                 ORDER BY timestamp DESC
-                 LIMIT ?3",
+                 FROM (
+                     SELECT * FROM candles
+                     WHERE coin = ?1 AND interval = ?2
+                     ORDER BY timestamp DESC
+                     LIMIT ?3
+                 )
+                 ORDER BY timestamp ASC",
             )
             .map_err(|e| format!("Prepare failed: {e}"))?;
 
@@ -183,6 +186,40 @@ impl Database {
             .map_err(|e| format!("Query failed: {e}"))?;
 
         Ok(result.and_then(|ts| DateTime::<Utc>::from_timestamp(ts, 0)))
+    }
+
+    /// Prune old candle data based on retention policy per interval.
+    pub fn prune(&self) -> Result<usize, String> {
+        let now = Utc::now().timestamp();
+        let retention = [
+            ("5m", 3 * 86400),        // 3 days
+            ("15m", 7 * 86400),       // 7 days
+            ("1h", 30 * 86400),       // 30 days
+            ("4h", 90 * 86400),       // 90 days
+            ("1d", 365 * 86400),      // 1 year
+            ("7d", 2 * 365 * 86400),  // 2 years
+            // 30d: keep all
+        ];
+
+        let mut total_deleted = 0usize;
+        for (interval, max_age) in &retention {
+            let cutoff = now - max_age;
+            let deleted = self
+                .conn
+                .execute(
+                    "DELETE FROM candles WHERE interval = ?1 AND timestamp < ?2",
+                    params![interval, cutoff],
+                )
+                .map_err(|e| format!("Prune failed for {interval}: {e}"))?;
+            total_deleted += deleted;
+        }
+
+        if total_deleted > 0 {
+            let _ = self.conn.execute_batch("VACUUM");
+            info!("Pruned {total_deleted} old candles");
+        }
+
+        Ok(total_deleted)
     }
 
     /// Get database file size in bytes.

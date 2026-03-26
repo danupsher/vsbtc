@@ -1,12 +1,12 @@
 [package]
-name = "cryptoscreener"
+name = "vsbtc"
 version = "0.1.0"
 edition = "2024"
-description = "Real-time crypto volatility screener powered by Hyperliquid"
+description = "Real-time crypto relative strength screener vs BTC — powered by Hyperliquid"
 
 [dependencies]
 # UI
-eframe = "0.31"
+eframe = { version = "0.31", features = ["persistence"] }
 egui = "0.31"
 egui_extras = { version = "0.31", features = ["syntect"] }
 
@@ -39,3 +39,6 @@ chrono = { version = "0.4", features = ["serde"] }
 
 # Config
 toml = "0.8"
+
+# Image (for icon loading)
+image = { version = "0.25", default-features = false, features = ["png"] }

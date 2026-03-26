@@ -26,6 +26,12 @@ pub enum FeedMessage {
     LiveCandle(Candle),
     /// Backfill progress update.
     Progress(BackfillProgress),
+    /// Computed metrics for all coins (sent periodically from analysis loop).
+    MetricsUpdate(Vec<crate::analysis::CoinMetrics>),
+    /// Updated BTC state.
+    BtcStateUpdate(crate::analysis::BtcState),
+    /// Database file size update.
+    DbSize(u64),
     /// WebSocket connection status.
     Connected(bool),
     /// An error occurred.
@@ -59,6 +65,13 @@ impl HyperliquidFeed {
             meta.get(0).and_then(|m| m.get("universe")).and_then(|u| u.as_array()),
             meta.get(1).and_then(|c| c.as_array()),
         ) {
+            if universe.len() != contexts.len() {
+                warn!(
+                    "Perp metadata length mismatch: {} assets vs {} contexts",
+                    universe.len(),
+                    contexts.len()
+                );
+            }
             for (asset, ctx) in universe.iter().zip(contexts.iter()) {
                 let name = asset
                     .get("name")
@@ -75,6 +88,27 @@ impl HyperliquidFeed {
                     .and_then(|v| v.as_str())
                     .and_then(|v| v.parse::<f64>().ok())
                     .unwrap_or(0.0);
+                let open_interest = ctx
+                    .get("openInterest")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0)
+                    * price; // Convert from coins to notional USD
+                let funding_rate = ctx
+                    .get("funding")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let prev_price = ctx
+                    .get("prevDayPx")
+                    .and_then(|v| v.as_str())
+                    .and_then(|v| v.parse::<f64>().ok())
+                    .unwrap_or(0.0);
+                let change_24h_pct = if prev_price > 0.0 {
+                    ((price - prev_price) / prev_price) * 100.0
+                } else {
+                    0.0
+                };
 
                 if !name.is_empty() {
                     coins.push(CoinInfo {
@@ -82,71 +116,32 @@ impl HyperliquidFeed {
                         is_perp: true,
                         price,
                         volume_24h,
+                        open_interest,
+                        funding_rate,
+                        change_24h_pct,
                     });
                 }
             }
         }
 
-        // Fetch spot metadata and market data
-        let spot_meta: Value = self
-            .client
-            .post(HL_REST_URL)
-            .json(&json!({"type": "spotMetaAndAssetCtxs"}))
-            .send()
-            .await
-            .map_err(|e| format!("Failed to fetch spot meta: {e}"))?
-            .json()
-            .await
-            .map_err(|e| format!("Failed to parse spot meta: {e}"))?;
-
-        if let (Some(tokens), Some(contexts)) = (
-            spot_meta
-                .get(0)
-                .and_then(|m| m.get("tokens"))
-                .and_then(|t| t.as_array()),
-            spot_meta.get(1).and_then(|c| c.as_array()),
-        ) {
-            for (token, ctx) in tokens.iter().zip(contexts.iter()) {
-                let name = token
-                    .get("name")
-                    .and_then(|n| n.as_str())
-                    .unwrap_or("")
-                    .to_string();
-                let price = ctx
-                    .get("markPx")
-                    .and_then(|p| p.as_str())
-                    .and_then(|p| p.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-                let volume_24h = ctx
-                    .get("dayNtlVlm")
-                    .and_then(|v| v.as_str())
-                    .and_then(|v| v.parse::<f64>().ok())
-                    .unwrap_or(0.0);
-
-                if !name.is_empty() && price > 0.0 {
-                    coins.push(CoinInfo {
-                        name,
-                        is_perp: false,
-                        price,
-                        volume_24h,
-                    });
-                }
-            }
-        }
-
-        info!("Fetched {} coins from Hyperliquid", coins.len());
+        info!("Fetched {} perp coins from Hyperliquid", coins.len());
         Ok(coins)
     }
 
     /// Fetch historical candles for a coin at a given interval.
+    /// If `since` is provided, fetches from that time; otherwise uses lookback_count.
     pub async fn fetch_candles(
         &self,
         coin: &str,
         interval: Interval,
         lookback_count: usize,
+        since: Option<DateTime<Utc>>,
     ) -> Result<Vec<Candle>, String> {
         let now = Utc::now().timestamp_millis();
-        let start = now - (interval.duration_secs() * lookback_count as i64 * 1000);
+        let start = match since {
+            Some(ts) => ts.timestamp_millis(),
+            None => now - (interval.duration_secs() * lookback_count as i64 * 1000),
+        };
 
         let body = json!({
             "type": "candleSnapshot",
@@ -213,10 +208,13 @@ impl HyperliquidFeed {
                 coin: coin.name.clone(),
                 current: i + 1,
                 total,
+                fetched: 0,
+                skipped: 0,
+                phase: "Backfill",
             }));
 
             for interval in Interval::all() {
-                match self.fetch_candles(&coin.name, *interval, lookback_count).await {
+                match self.fetch_candles(&coin.name, *interval, lookback_count, None).await {
                     Ok(candles) if !candles.is_empty() => {
                         let _ = tx.send(FeedMessage::CandleBatch(candles));
                     }
@@ -252,13 +250,20 @@ impl HyperliquidFeed {
                 }
             };
 
-            // Subscribe to candle updates for all coins
+            // Build a map from API name -> display name for re-tagging WS candles
+            let mut api_to_display: std::collections::HashMap<String, String> =
+                std::collections::HashMap::new();
+            for coin in coins {
+                api_to_display.insert(coin.api_name().to_string(), coin.name.clone());
+            }
+
+            // Subscribe to candle updates for all coins (using API name)
             for coin in coins {
                 let sub = json!({
                     "method": "subscribe",
                     "subscription": {
                         "type": "candle",
-                        "coin": coin.name,
+                        "coin": coin.api_name(),
                         "interval": "5m",
                     }
                 });
@@ -272,7 +277,11 @@ impl HyperliquidFeed {
                 match msg {
                     Ok(Message::Text(text)) => {
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                            if let Some(candle) = parse_ws_candle(&val) {
+                            if let Some(mut candle) = parse_ws_candle(&val) {
+                                // Re-tag with display name if it's a spot coin
+                                if let Some(display) = api_to_display.get(&candle.coin) {
+                                    candle.coin = display.clone();
+                                }
                                 let _ = tx.send(FeedMessage::LiveCandle(candle));
                             }
                         }

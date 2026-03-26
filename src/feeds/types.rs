@@ -72,6 +72,19 @@ impl Interval {
             Interval::D30 => 2592000,
         }
     }
+
+    /// Max candles to keep/request per interval (matches retention policy).
+    pub fn max_candles(&self) -> usize {
+        match self {
+            Interval::M5 => 864,   // 3 days
+            Interval::M15 => 672,  // 7 days
+            Interval::H1 => 720,   // 30 days
+            Interval::H4 => 540,   // 90 days
+            Interval::D1 => 365,   // 1 year
+            Interval::D7 => 104,   // 2 years
+            Interval::D30 => 200,  // all available
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -80,6 +93,16 @@ pub struct CoinInfo {
     pub is_perp: bool,
     pub price: f64,
     pub volume_24h: f64,
+    pub open_interest: f64,
+    pub funding_rate: f64,
+    pub change_24h_pct: f64,
+}
+
+impl CoinInfo {
+    /// Get the API-compatible coin name (strips /SPOT suffix for spot coins).
+    pub fn api_name(&self) -> &str {
+        self.name.strip_suffix("/SPOT").unwrap_or(&self.name)
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -87,4 +110,7 @@ pub struct BackfillProgress {
     pub coin: String,
     pub current: usize,
     pub total: usize,
+    pub fetched: usize,
+    pub skipped: usize,
+    pub phase: &'static str,
 }

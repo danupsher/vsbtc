@@ -7,7 +7,10 @@ pub struct CoinMetrics {
     pub coin: String,
     pub is_perp: bool,
     pub price: f64,
+    pub change_24h_pct: f64,
     pub volume_24h: f64,
+    pub open_interest: f64,
+    pub funding_rate: f64,
     /// Volatility per timeframe (normalized std dev of returns).
     pub volatility: HashMap<Interval, f64>,
     /// Correlation with BTC per timeframe (-1.0 to 1.0).
@@ -215,30 +218,22 @@ impl AnalysisEngine {
     }
 
     /// Compute composite score for ranking.
-    /// Higher = more likely to pump on BTC recovery.
-    pub fn composite_score(metrics: &CoinMetrics, btc_is_dipping: bool) -> f64 {
-        // Average volatility across timeframes
+    /// Higher = more volatile, liquid, outperforming BTC with high beta.
+    pub fn composite_score(metrics: &CoinMetrics) -> f64 {
         let avg_vol = if metrics.volatility.is_empty() {
             0.0
         } else {
             metrics.volatility.values().sum::<f64>() / metrics.volatility.len() as f64
         };
 
-        // Volume factor (log scale, normalized)
         let vol_factor = if metrics.volume_24h > 0.0 {
             (metrics.volume_24h.ln() / 20.0).clamp(0.0, 1.0)
         } else {
             0.0
         };
 
-        // Relative strength bonus (only matters when BTC is dipping)
-        let rs_factor = if btc_is_dipping {
-            (metrics.relative_strength * 10.0).clamp(-1.0, 1.0)
-        } else {
-            0.0
-        };
+        let rs_factor = (metrics.relative_strength * 10.0).clamp(-1.0, 1.0);
 
-        // Average beta
         let avg_beta = if metrics.btc_beta.is_empty() {
             1.0
         } else {
@@ -246,7 +241,6 @@ impl AnalysisEngine {
         };
         let beta_factor = (avg_beta / 2.0).clamp(0.0, 1.0);
 
-        // Weighted composite
         let score = (avg_vol * 30.0) + (vol_factor * 20.0) + (rs_factor * 35.0) + (beta_factor * 15.0);
 
         score.clamp(0.0, 100.0)

@@ -27,14 +27,17 @@ pub enum MarketFilter {
 pub enum SortColumn {
     Coin,
     Price,
+    Change24h,
     Volume,
+    OpenInterest,
+    FundingRate,
     Volatility(Interval),
     RelativeStrength,
     Beta,
     Score,
 }
 
-pub struct CryptoScreenerApp {
+pub struct VsBtcApp {
     // Data
     pub metrics: HashMap<String, CoinMetrics>,
     pub btc_state: BtcState,
@@ -44,6 +47,9 @@ pub struct CryptoScreenerApp {
     pub backfill_coin: String,
     pub backfill_current: usize,
     pub backfill_total: usize,
+    pub backfill_fetched: usize,
+    pub backfill_skipped: usize,
+    pub backfill_phase: &'static str,
 
     // Connection
     pub ws_connected: bool,
@@ -63,7 +69,7 @@ pub struct CryptoScreenerApp {
     pub rx: mpsc::UnboundedReceiver<FeedMessage>,
 }
 
-impl CryptoScreenerApp {
+impl VsBtcApp {
     pub fn new(
         _cc: &eframe::CreationContext<'_>,
         rx: mpsc::UnboundedReceiver<FeedMessage>,
@@ -75,11 +81,14 @@ impl CryptoScreenerApp {
             backfill_coin: String::new(),
             backfill_current: 0,
             backfill_total: 0,
+            backfill_fetched: 0,
+            backfill_skipped: 0,
+            backfill_phase: "",
             ws_connected: false,
             last_update: std::time::Instant::now(),
             coins_tracked: 0,
             db_size: 0,
-            sort_column: SortColumn::Score,
+            sort_column: SortColumn::OpenInterest,
             sort_ascending: false,
             market_filter: MarketFilter::All,
             search_query: String::new(),
@@ -103,7 +112,10 @@ impl CryptoScreenerApp {
                                 coin: coin.name.clone(),
                                 is_perp: coin.is_perp,
                                 price: coin.price,
+                                change_24h_pct: coin.change_24h_pct,
                                 volume_24h: coin.volume_24h,
+                                open_interest: coin.open_interest,
+                                funding_rate: coin.funding_rate,
                                 ..Default::default()
                             });
                     }
@@ -112,7 +124,10 @@ impl CryptoScreenerApp {
                     self.backfill_coin = p.coin;
                     self.backfill_current = p.current;
                     self.backfill_total = p.total;
-                    if p.current == p.total {
+                    self.backfill_fetched = p.fetched;
+                    self.backfill_skipped = p.skipped;
+                    self.backfill_phase = p.phase;
+                    if p.current == p.total && p.phase == "Background" {
                         self.phase = AppPhase::Live;
                     }
                 }
@@ -126,6 +141,18 @@ impl CryptoScreenerApp {
                         m.price = candle.close;
                     }
                     self.last_update = std::time::Instant::now();
+                }
+                FeedMessage::MetricsUpdate(all_metrics) => {
+                    for m in all_metrics {
+                        self.metrics.insert(m.coin.clone(), m);
+                    }
+                    self.last_update = std::time::Instant::now();
+                }
+                FeedMessage::BtcStateUpdate(state) => {
+                    self.btc_state = state;
+                }
+                FeedMessage::DbSize(size) => {
+                    self.db_size = size;
                 }
                 FeedMessage::Connected(status) => {
                     self.ws_connected = status;
@@ -142,11 +169,6 @@ impl CryptoScreenerApp {
         let mut coins: Vec<&CoinMetrics> = self
             .metrics
             .values()
-            .filter(|m| match self.market_filter {
-                MarketFilter::All => true,
-                MarketFilter::Perps => m.is_perp,
-                MarketFilter::Spot => !m.is_perp,
-            })
             .filter(|m| {
                 self.search_query.is_empty()
                     || m.coin
@@ -154,25 +176,29 @@ impl CryptoScreenerApp {
                         .contains(&self.search_query.to_lowercase())
             })
             .filter(|m| m.volume_24h >= self.min_volume)
+            .filter(|m| {
+                self.min_volatility <= 0.0
+                    || avg_map(&m.volatility) >= self.min_volatility
+            })
             .collect();
 
         coins.sort_by(|a, b| {
+            let cmp = |x: f64, y: f64| x.partial_cmp(&y).unwrap_or(std::cmp::Ordering::Equal);
             let ord = match self.sort_column {
                 SortColumn::Coin => a.coin.cmp(&b.coin),
-                SortColumn::Price => a.price.partial_cmp(&b.price).unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Volume => a.volume_24h.partial_cmp(&b.volume_24h).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::Price => cmp(a.price, b.price),
+                SortColumn::Change24h => cmp(a.change_24h_pct, b.change_24h_pct),
+                SortColumn::Volume => cmp(a.volume_24h, b.volume_24h),
+                SortColumn::OpenInterest => cmp(a.open_interest, b.open_interest),
+                SortColumn::FundingRate => cmp(a.funding_rate, b.funding_rate),
                 SortColumn::Volatility(interval) => {
                     let va = a.volatility.get(&interval).unwrap_or(&0.0);
                     let vb = b.volatility.get(&interval).unwrap_or(&0.0);
-                    va.partial_cmp(vb).unwrap_or(std::cmp::Ordering::Equal)
+                    cmp(*va, *vb)
                 }
-                SortColumn::RelativeStrength => a.relative_strength.partial_cmp(&b.relative_strength).unwrap_or(std::cmp::Ordering::Equal),
-                SortColumn::Beta => {
-                    let ba = avg_map(&a.btc_beta);
-                    let bb = avg_map(&b.btc_beta);
-                    ba.partial_cmp(&bb).unwrap_or(std::cmp::Ordering::Equal)
-                }
-                SortColumn::Score => a.score.partial_cmp(&b.score).unwrap_or(std::cmp::Ordering::Equal),
+                SortColumn::RelativeStrength => cmp(a.relative_strength, b.relative_strength),
+                SortColumn::Beta => cmp(avg_map(&a.btc_beta), avg_map(&b.btc_beta)),
+                SortColumn::Score => cmp(a.score, b.score),
             };
             if self.sort_ascending { ord } else { ord.reverse() }
         });
@@ -180,22 +206,9 @@ impl CryptoScreenerApp {
         coins
     }
 
-    /// Get coins currently firing signals.
-    fn signal_coins(&self) -> Vec<&CoinMetrics> {
-        if !self.btc_state.is_dipping {
-            return Vec::new();
-        }
-        let mut signals: Vec<&CoinMetrics> = self
-            .metrics
-            .values()
-            .filter(|m| m.score >= 70.0 && m.relative_strength > 0.0 && m.volume_24h >= 100_000.0)
-            .collect();
-        signals.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
-        signals
-    }
 }
 
-impl eframe::App for CryptoScreenerApp {
+impl eframe::App for VsBtcApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.process_messages();
 
@@ -206,23 +219,14 @@ impl eframe::App for CryptoScreenerApp {
             AppPhase::Initializing => {
                 render_loading(ctx, "Connecting to Hyperliquid...", 0, 0, "");
             }
-            AppPhase::Backfilling => {
-                render_loading(
-                    ctx,
-                    "Backfilling historical data",
-                    self.backfill_current,
-                    self.backfill_total,
-                    &self.backfill_coin,
-                );
-            }
-            AppPhase::Live => {
+            AppPhase::Backfilling | AppPhase::Live => {
                 self.render_live(ctx);
             }
         }
     }
 }
 
-impl CryptoScreenerApp {
+impl VsBtcApp {
     fn render_live(&mut self, ctx: &egui::Context) {
         // Top panel — BTC status
         egui::TopBottomPanel::top("btc_status").show(ctx, |ui| {
@@ -236,28 +240,6 @@ impl CryptoScreenerApp {
                     egui::Color32::from_rgb(255, 80, 80)
                 };
                 ui.colored_label(change_color, format!("24h: {:.1}%", self.btc_state.change_24h_pct));
-                ui.separator();
-
-                let dd_color = if self.btc_state.drawdown_pct < -2.0 {
-                    egui::Color32::from_rgb(255, 80, 80)
-                } else {
-                    egui::Color32::from_rgb(180, 180, 180)
-                };
-                ui.colored_label(dd_color, format!("Drawdown: {:.1}%", self.btc_state.drawdown_pct));
-                ui.separator();
-
-                if self.btc_state.is_dipping {
-                    ui.colored_label(
-                        egui::Color32::from_rgb(255, 160, 0),
-                        format!(
-                            "DIPPING ({})",
-                            format_duration(self.btc_state.dip_duration_secs)
-                        ),
-                    );
-                } else {
-                    ui.label("Normal");
-                }
-
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     let conn_color = if self.ws_connected {
                         egui::Color32::from_rgb(0, 200, 80)
@@ -271,14 +253,37 @@ impl CryptoScreenerApp {
 
         // Bottom panel — status bar
         egui::TopBottomPanel::bottom("status_bar").show(ctx, |ui| {
-            ui.horizontal(|ui| {
-                let elapsed = self.last_update.elapsed().as_secs_f64();
-                ui.label(format!("Last update: {:.1}s ago", elapsed));
-                ui.separator();
-                ui.label(format!("Coins: {}", self.coins_tracked));
-                ui.separator();
-                ui.label(format!("DB: {}", format_bytes(self.db_size)));
-            });
+            if self.phase == AppPhase::Backfilling && self.backfill_total > 0 {
+                let progress = self.backfill_current as f32 / self.backfill_total as f32;
+                let remaining = self.backfill_total - self.backfill_current;
+                ui.horizontal(|ui| {
+                    ui.label(
+                        egui::RichText::new(format!("[{}]", self.backfill_phase))
+                            .color(egui::Color32::from_rgb(255, 200, 0)),
+                    );
+                    ui.add(
+                        egui::ProgressBar::new(progress)
+                            .text(format!(
+                                "{}/{} — {} (fetched: {}, skipped: {})",
+                                self.backfill_current,
+                                self.backfill_total,
+                                self.backfill_coin,
+                                self.backfill_fetched,
+                                self.backfill_skipped,
+                            ))
+                            .desired_width(ui.available_width() - 10.0),
+                    );
+                });
+            } else {
+                ui.horizontal(|ui| {
+                    let elapsed = self.last_update.elapsed().as_secs_f64();
+                    ui.label(format!("Last update: {:.1}s ago", elapsed));
+                    ui.separator();
+                    ui.label(format!("Coins: {}", self.coins_tracked));
+                    ui.separator();
+                    ui.label(format!("DB: {}", format_bytes(self.db_size)));
+                });
+            }
         });
 
         // Central panel
@@ -293,41 +298,60 @@ impl CryptoScreenerApp {
                 ui.add(egui::DragValue::new(&mut self.min_volume).speed(10000.0).prefix("$"));
                 ui.separator();
 
-                ui.label("Type:");
-                ui.selectable_value(&mut self.market_filter, MarketFilter::All, "All");
-                ui.selectable_value(&mut self.market_filter, MarketFilter::Perps, "Perps");
-                ui.selectable_value(&mut self.market_filter, MarketFilter::Spot, "Spot");
             });
 
             ui.add_space(8.0);
 
-            // Signals section
-            let signals = self.signal_coins();
-            if !signals.is_empty() {
-                ui.heading(
-                    egui::RichText::new(format!("SIGNALS ({})", signals.len()))
-                        .color(egui::Color32::from_rgb(255, 200, 0)),
-                );
-                render_coin_table(ui, &signals, "signals_table");
-                ui.add_space(12.0);
-            } else if self.btc_state.is_dipping {
-                ui.colored_label(
-                    egui::Color32::from_rgb(180, 180, 0),
-                    "BTC dipping — no coins meeting signal criteria yet",
-                );
-                ui.add_space(8.0);
-            }
-
-            // All coins table
-            ui.heading("All Coins");
-
             let coins = self.sorted_coins();
-            render_coin_table(ui, &coins, "all_coins_table");
+            let sort_col = self.sort_column;
+            let sort_asc = self.sort_ascending;
+            let (new_col, new_asc) = render_coin_table(ui, &coins, "all_coins_table", sort_col, sort_asc);
+            self.sort_column = new_col;
+            self.sort_ascending = new_asc;
         });
     }
 }
 
-fn render_coin_table(ui: &mut egui::Ui, coins: &[&CoinMetrics], id: &str) {
+fn sort_header(
+    ui: &mut egui::Ui,
+    label: &str,
+    column: SortColumn,
+    current_col: SortColumn,
+    current_asc: bool,
+) -> Option<(SortColumn, bool)> {
+    let arrow = if current_col == column {
+        if current_asc { " ▲" } else { " ▼" }
+    } else {
+        ""
+    };
+    let text = format!("{label}{arrow}");
+    let response = ui.add(
+        egui::Label::new(egui::RichText::new(text).strong())
+            .sense(egui::Sense::click()),
+    );
+    if response.hovered() {
+        ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+    }
+    if response.clicked() {
+        if current_col == column {
+            Some((column, !current_asc))
+        } else {
+            Some((column, false))
+        }
+    } else {
+        None
+    }
+}
+
+fn render_coin_table(
+    ui: &mut egui::Ui,
+    coins: &[&CoinMetrics],
+    id: &str,
+    sort_col: SortColumn,
+    sort_asc: bool,
+) -> (SortColumn, bool) {
+    let mut new_sort = (sort_col, sort_asc);
+
     egui::ScrollArea::both()
         .id_salt(id)
         .show(ui, |ui| {
@@ -335,30 +359,64 @@ fn render_coin_table(ui: &mut egui::Ui, coins: &[&CoinMetrics], id: &str) {
                 .striped(true)
                 .spacing([8.0, 4.0])
                 .show(ui, |ui| {
-                    // Header
-                    ui.strong("Coin");
-                    ui.strong("Price");
-                    ui.strong("Vol 24h");
+                    // Headers — CEX-style order then vsBTC columns
+                    let mut headers: Vec<(String, SortColumn)> = vec![
+                        ("Coin".into(), SortColumn::Coin),
+                        ("Price".into(), SortColumn::Price),
+                        ("24h%".into(), SortColumn::Change24h),
+                        ("Vol 24h".into(), SortColumn::Volume),
+                        ("OI".into(), SortColumn::OpenInterest),
+                        ("Funding".into(), SortColumn::FundingRate),
+                    ];
                     for interval in Interval::all() {
-                        ui.strong(format!("V.{}", interval.as_str()));
+                        headers.push((
+                            format!("V.{}", interval.as_str()),
+                            SortColumn::Volatility(*interval),
+                        ));
                     }
-                    ui.strong("RS%");
-                    ui.strong("Beta");
-                    ui.strong("Score");
+                    headers.push(("RS%".into(), SortColumn::RelativeStrength));
+                    headers.push(("Beta".into(), SortColumn::Beta));
+                    headers.push(("Score".into(), SortColumn::Score));
+
+                    for (label, col) in &headers {
+                        if let Some(s) = sort_header(ui, label, *col, sort_col, sort_asc) {
+                            new_sort = s;
+                        }
+                    }
                     ui.end_row();
 
                     // Rows
                     for m in coins {
                         ui.label(&m.coin);
                         ui.monospace(format_price(m.price));
+
+                        // 24h change — green/red
+                        let change_color = if m.change_24h_pct >= 0.0 {
+                            egui::Color32::from_rgb(0, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(255, 80, 80)
+                        };
+                        ui.colored_label(change_color, format!("{:+.2}%", m.change_24h_pct));
+
                         ui.monospace(format_volume(m.volume_24h));
 
+                        ui.monospace(format_volume(m.open_interest));
+
+                        let fr_color = if m.funding_rate >= 0.0 {
+                            egui::Color32::from_rgb(0, 200, 80)
+                        } else {
+                            egui::Color32::from_rgb(255, 80, 80)
+                        };
+                        ui.colored_label(fr_color, format!("{:+.4}%", m.funding_rate * 100.0));
+
+                        // Volatility per timeframe
                         for interval in Interval::all() {
                             let vol = m.volatility.get(interval).unwrap_or(&0.0);
                             let color = volatility_color(*vol);
                             ui.colored_label(color, format!("{:.2}", vol));
                         }
 
+                        // Relative strength
                         let rs_color = if m.relative_strength >= 0.0 {
                             egui::Color32::from_rgb(0, 200, 80)
                         } else {
@@ -375,6 +433,8 @@ fn render_coin_table(ui: &mut egui::Ui, coins: &[&CoinMetrics], id: &str) {
                     }
                 });
         });
+
+    new_sort
 }
 
 fn render_loading(ctx: &egui::Context, message: &str, current: usize, total: usize, coin: &str) {
@@ -382,7 +442,7 @@ fn render_loading(ctx: &egui::Context, message: &str, current: usize, total: usi
         ui.vertical_centered(|ui| {
             ui.add_space(ui.available_height() / 3.0);
 
-            ui.heading("CryptoScreener");
+            ui.heading("vsBTC");
             ui.add_space(20.0);
 
             ui.label(message);

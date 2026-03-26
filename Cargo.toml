@@ -42,3 +42,6 @@ toml = "0.8"
 
 # Image (for icon loading)
 image = { version = "0.25", default-features = false, features = ["png"] }
+
+# Open URLs in default browser
+open = "5"

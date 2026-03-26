@@ -13,14 +13,12 @@ pub struct CoinMetrics {
     pub funding_rate: f64,
     /// Volatility per timeframe (normalized std dev of returns).
     pub volatility: HashMap<Interval, f64>,
+    /// % change vs BTC per timeframe (coin return - BTC return).
+    pub vs_btc: HashMap<Interval, f64>,
     /// Correlation with BTC per timeframe (-1.0 to 1.0).
     pub btc_correlation: HashMap<Interval, f64>,
     /// Beta vs BTC per timeframe.
     pub btc_beta: HashMap<Interval, f64>,
-    /// Relative strength vs BTC (current period return minus BTC return).
-    pub relative_strength: f64,
-    /// Composite score (higher = more likely to pump on BTC recovery).
-    pub score: f64,
 }
 
 /// BTC market state.
@@ -217,32 +215,4 @@ impl AnalysisEngine {
         }
     }
 
-    /// Compute composite score for ranking.
-    /// Higher = more volatile, liquid, outperforming BTC with high beta.
-    pub fn composite_score(metrics: &CoinMetrics) -> f64 {
-        let avg_vol = if metrics.volatility.is_empty() {
-            0.0
-        } else {
-            metrics.volatility.values().sum::<f64>() / metrics.volatility.len() as f64
-        };
-
-        let vol_factor = if metrics.volume_24h > 0.0 {
-            (metrics.volume_24h.ln() / 20.0).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-
-        let rs_factor = (metrics.relative_strength * 10.0).clamp(-1.0, 1.0);
-
-        let avg_beta = if metrics.btc_beta.is_empty() {
-            1.0
-        } else {
-            metrics.btc_beta.values().sum::<f64>() / metrics.btc_beta.len() as f64
-        };
-        let beta_factor = (avg_beta / 2.0).clamp(0.0, 1.0);
-
-        let score = (avg_vol * 30.0) + (vol_factor * 20.0) + (rs_factor * 35.0) + (beta_factor * 15.0);
-
-        score.clamp(0.0, 100.0)
-    }
 }

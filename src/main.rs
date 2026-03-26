@@ -362,14 +362,19 @@ fn compute_and_send_metrics(
     let btc_state = AnalysisEngine::compute_btc_state(&btc_candles_1h, btc_current_price);
     let _ = tx.send(FeedMessage::BtcStateUpdate(btc_state.clone()));
 
-    // BTC returns per interval for correlation/beta
+    // Pre-fetch BTC data per interval (used for correlation, beta, and vs BTC)
     let mut btc_returns: std::collections::HashMap<feeds::Interval, Vec<f64>> =
+        std::collections::HashMap::new();
+    let mut btc_last2: std::collections::HashMap<feeds::Interval, Vec<feeds::Candle>> =
         std::collections::HashMap::new();
     for interval in feeds::Interval::all() {
         let btc_candles = db
             .get_candles("BTC", *interval, interval.max_candles())
             .unwrap_or_default();
         btc_returns.insert(*interval, AnalysisEngine::log_returns(&btc_candles));
+        // Cache last 2 candles for vs BTC calculation
+        let last2: Vec<_> = btc_candles.iter().rev().take(2).rev().cloned().collect();
+        btc_last2.insert(*interval, last2);
     }
 
     let mut all_metrics = Vec::new();
@@ -407,18 +412,14 @@ fn compute_and_send_metrics(
                     .btc_beta
                     .insert(*interval, AnalysisEngine::beta(&coin_returns, btc_ret));
             }
+
+            // % change vs BTC for this timeframe (last candle period only)
+            if let Some(btc_c) = btc_last2.get(interval) {
+                let coin_last2: Vec<_> = candles.iter().rev().take(2).rev().cloned().collect();
+                let vs = AnalysisEngine::relative_strength(&coin_last2, btc_c);
+                metrics.vs_btc.insert(*interval, vs);
+            }
         }
-
-        let coin_candles_1h = db
-            .get_candles(&coin.name, feeds::Interval::H1, 24)
-            .unwrap_or_default();
-        let btc_candles_24h = db
-            .get_candles("BTC", feeds::Interval::H1, 24)
-            .unwrap_or_default();
-        metrics.relative_strength =
-            AnalysisEngine::relative_strength(&coin_candles_1h, &btc_candles_24h);
-
-        metrics.score = AnalysisEngine::composite_score(&metrics);
 
         if let Ok(latest) = db.get_candles(&coin.name, feeds::Interval::M5, 1) {
             if let Some(c) = latest.last() {

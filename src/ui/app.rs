@@ -32,9 +32,8 @@ pub enum SortColumn {
     OpenInterest,
     FundingRate,
     Volatility(Interval),
-    RelativeStrength,
+    VsBtc(Interval),
     Beta,
-    Score,
 }
 
 pub struct VsBtcApp {
@@ -196,9 +195,12 @@ impl VsBtcApp {
                     let vb = b.volatility.get(&interval).unwrap_or(&0.0);
                     cmp(*va, *vb)
                 }
-                SortColumn::RelativeStrength => cmp(a.relative_strength, b.relative_strength),
+                SortColumn::VsBtc(interval) => {
+                    let va = a.vs_btc.get(&interval).unwrap_or(&0.0);
+                    let vb = b.vs_btc.get(&interval).unwrap_or(&0.0);
+                    cmp(*va, *vb)
+                }
                 SortColumn::Beta => cmp(avg_map(&a.btc_beta), avg_map(&b.btc_beta)),
-                SortColumn::Score => cmp(a.score, b.score),
             };
             if self.sort_ascending { ord } else { ord.reverse() }
         });
@@ -374,9 +376,13 @@ fn render_coin_table(
                             SortColumn::Volatility(*interval),
                         ));
                     }
-                    headers.push(("RS%".into(), SortColumn::RelativeStrength));
+                    for interval in Interval::all() {
+                        headers.push((
+                            format!("vs.{}", interval.as_str()),
+                            SortColumn::VsBtc(*interval),
+                        ));
+                    }
                     headers.push(("Beta".into(), SortColumn::Beta));
-                    headers.push(("Score".into(), SortColumn::Score));
 
                     for (label, col) in &headers {
                         if let Some(s) = sort_header(ui, label, *col, sort_col, sort_asc) {
@@ -387,7 +393,18 @@ fn render_coin_table(
 
                     // Rows
                     for m in coins {
-                        ui.label(&m.coin);
+                        let coin_link = ui.add(
+                            egui::Label::new(
+                                egui::RichText::new(&m.coin).color(egui::Color32::from_rgb(100, 180, 255))
+                            ).sense(egui::Sense::click()),
+                        );
+                        if coin_link.clicked() {
+                            let url = format!("https://app.hyperliquid.xyz/trade/{}", m.coin);
+                            let _ = open::that(&url);
+                        }
+                        if coin_link.hovered() {
+                            ui.ctx().set_cursor_icon(egui::CursorIcon::PointingHand);
+                        }
                         ui.monospace(format_price(m.price));
 
                         // 24h change — green/red
@@ -410,25 +427,38 @@ fn render_coin_table(
                         ui.colored_label(fr_color, format!("{:+.4}%", m.funding_rate * 100.0));
 
                         // Volatility per timeframe
+                        let no_data = egui::Color32::from_rgb(80, 80, 80);
                         for interval in Interval::all() {
-                            let vol = m.volatility.get(interval).unwrap_or(&0.0);
-                            let color = volatility_color(*vol);
-                            ui.colored_label(color, format!("{:.2}", vol));
+                            match m.volatility.get(interval) {
+                                Some(vol) => {
+                                    let color = volatility_color(*vol);
+                                    ui.colored_label(color, format!("{:.2}", vol));
+                                }
+                                None => { ui.colored_label(no_data, "—"); }
+                            }
                         }
 
-                        // Relative strength
-                        let rs_color = if m.relative_strength >= 0.0 {
-                            egui::Color32::from_rgb(0, 200, 80)
+                        // vs BTC per timeframe
+                        for interval in Interval::all() {
+                            match m.vs_btc.get(interval) {
+                                Some(vs) => {
+                                    let pct = vs * 100.0;
+                                    let color = if pct >= 0.0 {
+                                        egui::Color32::from_rgb(0, 200, 80)
+                                    } else {
+                                        egui::Color32::from_rgb(255, 80, 80)
+                                    };
+                                    ui.colored_label(color, format!("{:+.1}%", pct));
+                                }
+                                None => { ui.colored_label(no_data, "—"); }
+                            }
+                        }
+
+                        if m.btc_beta.is_empty() {
+                            ui.colored_label(no_data, "—");
                         } else {
-                            egui::Color32::from_rgb(255, 80, 80)
-                        };
-                        ui.colored_label(rs_color, format!("{:+.1}%", m.relative_strength * 100.0));
-
-                        let avg_beta = avg_map(&m.btc_beta);
-                        ui.monospace(format!("{:.1}", avg_beta));
-
-                        let score_color = score_color(m.score);
-                        ui.colored_label(score_color, format!("{:.0}", m.score));
+                            ui.monospace(format!("{:.1}", avg_map(&m.btc_beta)));
+                        }
                         ui.end_row();
                     }
                 });

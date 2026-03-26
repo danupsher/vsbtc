@@ -30,22 +30,32 @@ Track how every Hyperliquid perp performs relative to Bitcoin across multiple ti
 
 Download the latest release for your platform from the [Releases page](https://github.com/danupsher/vsbtc/releases).
 
-| Platform | File |
-|---|---|
-| Linux x86_64 | `vsbtc-linux-x86_64.tar.gz` |
-| Linux aarch64 | `vsbtc-linux-aarch64.tar.gz` |
-| macOS x86_64 | `vsbtc-macos-x86_64.tar.gz` |
-| macOS Apple Silicon | `vsbtc-macos-aarch64.tar.gz` |
-| Windows x86_64 | `vsbtc-windows-x86_64.zip` |
+| Platform | File | Format |
+|---|---|---|
+| macOS Apple Silicon | `vsbtc-macos-aarch64.dmg` | .app in .dmg |
+| macOS Intel | `vsbtc-macos-x86_64.dmg` | .app in .dmg |
+| Windows x86_64 | `vsbtc-windows-x86_64.zip` | .exe with icon |
+| Linux x86_64 | `vsbtc-linux-x86_64.tar.gz` | binary + .desktop |
+| Linux aarch64 | `vsbtc-linux-aarch64.tar.gz` | binary + .desktop |
 
-Extract and run. No dependencies, no API keys needed — it connects directly to Hyperliquid's public API.
+No dependencies or API keys needed — connects directly to Hyperliquid's public API.
 
 ### macOS
 
-After extracting, you may need to remove the quarantine attribute:
+Open the `.dmg` and drag vsBTC to Applications. On first launch you may need to right-click > Open to bypass Gatekeeper, or run:
 
 ```bash
-xattr -d com.apple.quarantine vsbtc
+xattr -d com.apple.quarantine /Applications/vsBTC.app
+```
+
+### Linux
+
+Extract and run the binary. To integrate with your desktop, copy the included files:
+
+```bash
+cp vsbtc ~/.local/bin/
+cp vsbtc.png ~/.local/share/icons/
+cp vsbtc.desktop ~/.local/share/applications/
 ```
 
 ## Build from source

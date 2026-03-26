@@ -9,33 +9,19 @@ permissions:
   contents: write
 
 jobs:
-  build:
+  build-linux:
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
             name: vsbtc-linux-x86_64
             cross: false
           - target: aarch64-unknown-linux-gnu
-            os: ubuntu-latest
             name: vsbtc-linux-aarch64
             cross: true
-          - target: x86_64-apple-darwin
-            os: macos-latest
-            name: vsbtc-macos-x86_64
-            cross: false
-          - target: aarch64-apple-darwin
-            os: macos-latest
-            name: vsbtc-macos-aarch64
-            cross: false
-          - target: x86_64-pc-windows-msvc
-            os: windows-latest
-            name: vsbtc-windows-x86_64
-            cross: false
 
-    runs-on: ${{ matrix.os }}
+    runs-on: ubuntu-latest
 
     steps:
       - uses: actions/checkout@v4
@@ -49,8 +35,8 @@ jobs:
         if: matrix.cross
         run: cargo install cross --git https://github.com/cross-rs/cross
 
-      - name: Install Linux deps (x86_64)
-        if: matrix.target == 'x86_64-unknown-linux-gnu'
+      - name: Install Linux deps
+        if: "!matrix.cross"
         run: |
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev libxkbcommon-dev
@@ -63,28 +49,108 @@ jobs:
         if: "!matrix.cross"
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package (Unix)
-        if: runner.os != 'Windows'
+      - name: Package
         run: |
-          cd target/${{ matrix.target }}/release
-          tar czf ../../../${{ matrix.name }}.tar.gz vsbtc
-          cd ../../..
-
-      - name: Package (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          cd target/${{ matrix.target }}/release
-          7z a ../../../${{ matrix.name }}.zip vsbtc.exe
-          cd ../../..
+          mkdir -p package
+          cp target/${{ matrix.target }}/release/vsbtc package/
+          cp assets/icon.png package/vsbtc.png
+          cp assets/linux/vsbtc.desktop package/
+          cd package
+          tar czf ../${{ matrix.name }}.tar.gz vsbtc vsbtc.png vsbtc.desktop
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.name }}
-          path: ${{ matrix.name }}.*
+          path: ${{ matrix.name }}.tar.gz
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-apple-darwin
+            name: vsbtc-macos-x86_64
+          - target: aarch64-apple-darwin
+            name: vsbtc-macos-aarch64
+
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Create .app bundle
+        run: |
+          APP="vsBTC.app"
+          mkdir -p "$APP/Contents/MacOS"
+          mkdir -p "$APP/Contents/Resources"
+
+          # Copy binary
+          cp target/${{ matrix.target }}/release/vsbtc "$APP/Contents/MacOS/vsbtc"
+
+          # Copy Info.plist
+          cp assets/macos/Info.plist "$APP/Contents/Info.plist"
+
+          # Generate .icns from PNG
+          mkdir -p icon.iconset
+          sips -z 16 16     assets/icon.png --out icon.iconset/icon_16x16.png
+          sips -z 32 32     assets/icon.png --out icon.iconset/icon_16x16@2x.png
+          sips -z 32 32     assets/icon.png --out icon.iconset/icon_32x32.png
+          sips -z 64 64     assets/icon.png --out icon.iconset/icon_32x32@2x.png
+          sips -z 128 128   assets/icon.png --out icon.iconset/icon_128x128.png
+          sips -z 256 256   assets/icon.png --out icon.iconset/icon_128x128@2x.png
+          sips -z 256 256   assets/icon.png --out icon.iconset/icon_256x256.png
+          iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
+
+      - name: Create .dmg
+        run: |
+          mkdir -p dmg_contents
+          cp -r vsBTC.app dmg_contents/
+          ln -s /Applications dmg_contents/Applications
+          hdiutil create -volname "vsBTC" -srcfolder dmg_contents -ov -format UDZO ${{ matrix.name }}.dmg
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.name }}
+          path: ${{ matrix.name }}.dmg
+
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Build
+        run: cargo build --release --target x86_64-pc-windows-msvc
+
+      - name: Package
+        run: |
+          cd target/x86_64-pc-windows-msvc/release
+          7z a ../../../vsbtc-windows-x86_64.zip vsbtc.exe
+          cd ../../..
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: vsbtc-windows-x86_64
+          path: vsbtc-windows-x86_64.zip
 
   release:
-    needs: build
+    needs: [build-linux, build-macos, build-windows]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

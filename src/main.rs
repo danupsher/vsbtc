@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use feeds::hyperliquid::HyperliquidFeed;
 use feeds::FeedMessage;
 use store::Database;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tracing::info;
 
@@ -68,6 +69,7 @@ enum DbCommand {
     },
     ComputeMetrics {
         coins: Vec<feeds::CoinInfo>,
+        live_prices: std::collections::HashMap<String, f64>,
         tx: mpsc::UnboundedSender<FeedMessage>,
     },
     Prune,
@@ -106,8 +108,8 @@ fn spawn_db_thread() -> mpsc::UnboundedSender<DbCommand> {
                     let result = db.latest_candle_time(&coin, interval).unwrap_or(None);
                     let _ = reply.send(result);
                 }
-                DbCommand::ComputeMetrics { coins, tx } => {
-                    compute_and_send_metrics(&db, &coins, &tx);
+                DbCommand::ComputeMetrics { coins, live_prices, tx } => {
+                    compute_and_send_metrics(&db, &coins, &live_prices, &tx);
                 }
                 DbCommand::Prune => {
                     if let Err(e) = db.prune() {
@@ -194,9 +196,18 @@ async fn run_data_pipeline(tx: mpsc::UnboundedSender<FeedMessage>) {
         }));
     }
 
+    // Shared live prices — updated by WS allMids, read by metrics loop
+    let live_prices: Arc<Mutex<std::collections::HashMap<String, f64>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+
+    // Shared coin list — updated by periodic refresh
+    let shared_coins: Arc<Mutex<Vec<feeds::CoinInfo>>> =
+        Arc::new(Mutex::new(coins.clone()));
+
     // Compute metrics now — user has usable data
     let _ = db_tx.send(DbCommand::ComputeMetrics {
         coins: coins.clone(),
+        live_prices: live_prices.lock().unwrap().clone(),
         tx: tx.clone(),
     });
     info!(
@@ -209,10 +220,19 @@ async fn run_data_pipeline(tx: mpsc::UnboundedSender<FeedMessage>) {
     let (live_tx, mut live_rx) = mpsc::unbounded_channel::<FeedMessage>();
     let forward_tx = tx.clone();
     let forward_db_tx = db_tx.clone();
+    let ws_live_prices = live_prices.clone();
     tokio::spawn(async move {
         while let Some(msg) = live_rx.recv().await {
-            if let FeedMessage::LiveCandle(ref candle) = msg {
-                let _ = forward_db_tx.send(DbCommand::UpsertCandles(vec![candle.clone()]));
+            match msg {
+                FeedMessage::LiveCandle(ref candle) => {
+                    let _ = forward_db_tx.send(DbCommand::UpsertCandles(vec![candle.clone()]));
+                }
+                FeedMessage::PriceUpdate(ref prices) => {
+                    if let Ok(mut lp) = ws_live_prices.lock() {
+                        lp.extend(prices.iter().map(|(k, v)| (k.clone(), *v)));
+                    }
+                }
+                _ => {}
             }
             let _ = forward_tx.send(msg);
         }
@@ -225,15 +245,44 @@ async fn run_data_pipeline(tx: mpsc::UnboundedSender<FeedMessage>) {
     // Spawn periodic metrics recomputation (every 10 seconds)
     let metrics_tx = tx.clone();
     let metrics_db_tx = db_tx.clone();
-    let metrics_coins = coins.clone();
+    let metrics_live_prices = live_prices.clone();
+    let metrics_shared_coins = shared_coins.clone();
     tokio::spawn(async move {
         let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(10));
         loop {
             interval.tick().await;
+            let coins = metrics_shared_coins.lock().unwrap().clone();
+            let prices = metrics_live_prices.lock().unwrap().clone();
             let _ = metrics_db_tx.send(DbCommand::ComputeMetrics {
-                coins: metrics_coins.clone(),
+                coins,
+                live_prices: prices,
                 tx: metrics_tx.clone(),
             });
+        }
+    });
+
+    // Spawn periodic coin list refresh (every 60 seconds) — updates OI, funding, volume, 24h%
+    let refresh_feed = HyperliquidFeed::new();
+    let refresh_tx = tx.clone();
+    let refresh_db_tx = db_tx.clone();
+    let refresh_shared_coins = shared_coins.clone();
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(tokio::time::Duration::from_secs(60));
+        interval.tick().await; // skip first immediate tick
+        loop {
+            interval.tick().await;
+            match refresh_feed.fetch_coin_list().await {
+                Ok(new_coins) if !new_coins.is_empty() => {
+                    let _ = refresh_db_tx.send(DbCommand::UpsertCoins(new_coins.clone()));
+                    let _ = refresh_tx.send(FeedMessage::CoinList(new_coins.clone()));
+                    *refresh_shared_coins.lock().unwrap() = new_coins;
+                    info!("Refreshed coin list");
+                }
+                Ok(_) => {}
+                Err(e) => {
+                    tracing::warn!("Coin list refresh failed: {e}");
+                }
+            }
         }
     });
 
@@ -276,7 +325,8 @@ async fn run_data_pipeline(tx: mpsc::UnboundedSender<FeedMessage>) {
 
     // Final metrics recompute with all data
     let _ = db_tx.send(DbCommand::ComputeMetrics {
-        coins: coins.clone(),
+        coins: shared_coins.lock().unwrap().clone(),
+        live_prices: live_prices.lock().unwrap().clone(),
         tx: tx.clone(),
     });
 }
@@ -341,23 +391,19 @@ async fn fetch_candle_gap(
 fn compute_and_send_metrics(
     db: &Database,
     coins: &[feeds::CoinInfo],
+    live_prices: &std::collections::HashMap<String, f64>,
     tx: &mpsc::UnboundedSender<FeedMessage>,
 ) {
     let btc_candles_1h = db
         .get_candles("BTC", feeds::Interval::H1, 168)
         .unwrap_or_default();
 
-    let btc_price = coins
-        .iter()
-        .find(|c| c.name == "BTC")
-        .map(|c| c.price)
+    // Use live price if available, fall back to coin list price
+    let btc_current_price = live_prices
+        .get("BTC")
+        .copied()
+        .or_else(|| coins.iter().find(|c| c.name == "BTC").map(|c| c.price))
         .unwrap_or(0.0);
-
-    let btc_current_price = if let Some(latest) = btc_candles_1h.last() {
-        latest.close
-    } else {
-        btc_price
-    };
 
     let btc_state = AnalysisEngine::compute_btc_state(&btc_candles_1h, btc_current_price);
     let _ = tx.send(FeedMessage::BtcStateUpdate(btc_state.clone()));
@@ -380,10 +426,16 @@ fn compute_and_send_metrics(
     let mut all_metrics = Vec::new();
 
     for coin in coins {
+        // Use live price if available, otherwise fall back to coin list price
+        let current_price = live_prices
+            .get(&coin.name)
+            .copied()
+            .unwrap_or(coin.price);
+
         let mut metrics = CoinMetrics {
             coin: coin.name.clone(),
             is_perp: coin.is_perp,
-            price: coin.price,
+            price: current_price,
             change_24h_pct: coin.change_24h_pct,
             volume_24h: coin.volume_24h,
             open_interest: coin.open_interest,
@@ -418,12 +470,6 @@ fn compute_and_send_metrics(
                 let coin_last2: Vec<_> = candles.iter().rev().take(2).rev().cloned().collect();
                 let vs = AnalysisEngine::relative_strength(&coin_last2, btc_c);
                 metrics.vs_btc.insert(*interval, vs);
-            }
-        }
-
-        if let Ok(latest) = db.get_candles(&coin.name, feeds::Interval::M5, 1) {
-            if let Some(c) = latest.last() {
-                metrics.price = c.close;
             }
         }
 

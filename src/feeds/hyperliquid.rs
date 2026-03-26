@@ -24,6 +24,8 @@ pub enum FeedMessage {
     CandleBatch(Vec<Candle>),
     /// A live candle update from the WebSocket.
     LiveCandle(Candle),
+    /// Live mid prices for all coins from allMids subscription.
+    PriceUpdate(std::collections::HashMap<String, f64>),
     /// Backfill progress update.
     Progress(BackfillProgress),
     /// Computed metrics for all coins (sent periodically from analysis loop).
@@ -257,6 +259,17 @@ impl HyperliquidFeed {
                 api_to_display.insert(coin.api_name().to_string(), coin.name.clone());
             }
 
+            // Subscribe to allMids for real-time price updates
+            let mids_sub = json!({
+                "method": "subscribe",
+                "subscription": {
+                    "type": "allMids",
+                }
+            });
+            if let Err(e) = ws.send(Message::Text(mids_sub.to_string().into())).await {
+                error!("Failed to subscribe to allMids: {e}");
+            }
+
             // Subscribe to candle updates for all coins (using API name)
             for coin in coins {
                 let sub = json!({
@@ -277,7 +290,10 @@ impl HyperliquidFeed {
                 match msg {
                     Ok(Message::Text(text)) => {
                         if let Ok(val) = serde_json::from_str::<Value>(&text) {
-                            if let Some(mut candle) = parse_ws_candle(&val) {
+                            // Check for allMids update
+                            if let Some(prices) = parse_all_mids(&val, &api_to_display) {
+                                let _ = tx.send(FeedMessage::PriceUpdate(prices));
+                            } else if let Some(mut candle) = parse_ws_candle(&val) {
                                 // Re-tag with display name if it's a spot coin
                                 if let Some(display) = api_to_display.get(&candle.coin) {
                                     candle.coin = display.clone();
@@ -302,6 +318,36 @@ impl HyperliquidFeed {
             let _ = tx.send(FeedMessage::Connected(false));
             tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
         }
+    }
+}
+
+fn parse_all_mids(
+    val: &Value,
+    api_to_display: &std::collections::HashMap<String, String>,
+) -> Option<std::collections::HashMap<String, f64>> {
+    let channel = val.get("channel")?.as_str()?;
+    if channel != "allMids" {
+        return None;
+    }
+    let data = val.get("data")?;
+    let mids = data.get("mids")?.as_object()?;
+
+    let mut prices = std::collections::HashMap::new();
+    for (coin, price_val) in mids {
+        if let Some(price) = price_val.as_str().and_then(|p| p.parse::<f64>().ok()) {
+            // Map API name to display name if we know it, otherwise use as-is
+            let display_name = api_to_display
+                .get(coin.as_str())
+                .cloned()
+                .unwrap_or_else(|| coin.clone());
+            prices.insert(display_name, price);
+        }
+    }
+
+    if prices.is_empty() {
+        None
+    } else {
+        Some(prices)
     }
 }
 

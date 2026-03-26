@@ -103,20 +103,26 @@ impl VsBtcApp {
             match msg {
                 FeedMessage::CoinList(coins) => {
                     self.coins_tracked = coins.len();
-                    self.phase = AppPhase::Backfilling;
+                    if self.phase == AppPhase::Initializing {
+                        self.phase = AppPhase::Backfilling;
+                    }
                     for coin in &coins {
-                        self.metrics
+                        let entry = self.metrics
                             .entry(coin.name.clone())
                             .or_insert_with(|| CoinMetrics {
                                 coin: coin.name.clone(),
                                 is_perp: coin.is_perp,
-                                price: coin.price,
-                                change_24h_pct: coin.change_24h_pct,
-                                volume_24h: coin.volume_24h,
-                                open_interest: coin.open_interest,
-                                funding_rate: coin.funding_rate,
                                 ..Default::default()
                             });
+                        // Always refresh market data from coin list
+                        entry.change_24h_pct = coin.change_24h_pct;
+                        entry.volume_24h = coin.volume_24h;
+                        entry.open_interest = coin.open_interest;
+                        entry.funding_rate = coin.funding_rate;
+                        // Only update price if we don't have a live price yet
+                        if entry.price == 0.0 {
+                            entry.price = coin.price;
+                        }
                     }
                 }
                 FeedMessage::Progress(p) => {
@@ -135,9 +141,18 @@ impl VsBtcApp {
                     // We'll trigger a metrics recalc periodically.
                     self.last_update = std::time::Instant::now();
                 }
-                FeedMessage::LiveCandle(candle) => {
-                    if let Some(m) = self.metrics.get_mut(&candle.coin) {
-                        m.price = candle.close;
+                FeedMessage::LiveCandle(_candle) => {
+                    self.last_update = std::time::Instant::now();
+                }
+                FeedMessage::PriceUpdate(prices) => {
+                    for (coin, price) in &prices {
+                        if let Some(m) = self.metrics.get_mut(coin) {
+                            m.price = *price;
+                        }
+                    }
+                    // Update BTC price in header immediately
+                    if let Some(btc_price) = prices.get("BTC") {
+                        self.btc_state.price = *btc_price;
                     }
                     self.last_update = std::time::Instant::now();
                 }

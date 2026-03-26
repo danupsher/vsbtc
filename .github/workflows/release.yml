@@ -110,6 +110,9 @@ jobs:
           sips -z 256 256   assets/icon.png --out icon.iconset/icon_256x256.png
           iconutil -c icns icon.iconset -o "$APP/Contents/Resources/icon.icns"
 
+      - name: Ad-hoc sign app bundle
+        run: codesign --force --deep -s - vsBTC.app
+
       - name: Create .dmg
         run: |
           mkdir -p dmg_contents
